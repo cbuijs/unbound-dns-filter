@@ -395,19 +395,17 @@ def operate(id, event, qstate, qdata):
                             break
 
                 if status is not True: # Not blacklisted
-                    # Fix cache
-                    msg.set_return_msg(qstate)
-                    if qstate.return_msg.qinfo:
-                        invalidateQueryInCache(qstate, qstate.return_msg.qinfo)
-                    qstate.no_cache_store = 0
-                    storeQueryInCache(qstate, qstate.return_msg.qinfo, qstate.return_msg.rep, 0)
-                    qstate.return_msg.rep.security = 2
-
                     # End of processing
                     qstate.ext_state[id] = MODULE_FINISHED
                     return True
 
         # Block
+        msg.set_return_msg(qstate)
+        if qstate.return_msg.qinfo:
+            invalidateQueryInCache(qstate, qstate.return_msg.qinfo)
+        qstate.no_cache_store = 0
+        storeQueryInCache(qstate, qstate.return_msg.qinfo, qstate.return_msg.rep, 0)
+        qstate.return_msg.rep.security = 2
         qstate.return_rcode = RCODE_REFUSED
         qstate.ext_state[id] = MODULE_FINISHED
         return True
