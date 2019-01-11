@@ -429,7 +429,7 @@ def operate(id, event, qstate, qdata):
 
                             # Allow changes
                             qstate.return_rcode = RCODE_NOERROR
-                            if qstate.return_msg:
+                            if qstate.return_msg.qinfo:
                                 invalidateQueryInCache(qstate, qstate.return_msg.qinfo)
                             qstate.no_cache_store = 0
                             storeQueryInCache(qstate, qstate.return_msg.qinfo, qstate.return_msg.rep, 0)
@@ -443,7 +443,7 @@ def operate(id, event, qstate, qdata):
 
         # Block
         qstate.return_rcode = RCODE_REFUSED
-        if qstate.return_msg:
+        if qstate.return_msg.qinfo:
             invalidateQueryInCache(qstate, qstate.return_msg.qinfo)
         qstate.no_cache_store = 0
         storeQueryInCache(qstate, qstate.return_msg.qinfo, qstate.return_msg.rep, 0)
