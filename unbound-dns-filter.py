@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 '''
 =========================================================================================
- dns-filter.py: v0.02-20190111 Copyright (C) 2019 Chris Buijs <cbuijs@chrisbuijs.com>
+ dns-filter.py: v0.06-20190111 Copyright (C) 2019 Chris Buijs <cbuijs@chrisbuijs.com>
 =========================================================================================
 
  DNS filtering extension for the unbound DNS resolver.
@@ -163,8 +163,23 @@ def get_lines(filename, listname):
 
     return lines
 
-def is_blacklisted(testvalue, valuetype, checkip):
+def is_blacklisted(value, valuetype, checkip):
+    testvalue = regex.split('\s+', str(value))[-1]
+    if testvalue in cache:
+        result = cache.get(testvalue, None)
+        if result is True:
+            log_info('CACHE-BLACKLISTED: {0}'.format(testvalue))
+        elif result is False:
+            log_info('CACHE-WHITELISTED: {0}'.format(testvalue))
+        return result
+
+    result = check_blacklisted(testvalue, valuetype, checkip)
+    cache[testvalue] = result
+    return result
+
+def check_blacklisted(testvalue, valuetype, checkip):
     orgtestvalue = testvalue
+
     # Check against domain
     if is_dom.search(testvalue):
         if check_dom(valuetype, testvalue, wl_dom, 'WHITELIST'): # Whitelisted
@@ -205,12 +220,12 @@ def is_blacklisted(testvalue, valuetype, checkip):
     # Check against regex
     match = wl_big_rx.search(testvalue)
     if match: # Whitelisted
-        log_info('{0}-WHITELIST-RX-REFUSED: \"{1}\" -> \"{2}\"'.format(valuetype, testvalue, match.group(0)))
+        log_info('{0}-WHITELIST-RX: \"{1}\" -> \"{2}\"'.format(valuetype, testvalue, match.group(0)))
         return False
     else:
         match = bl_big_rx.search(testvalue)
         if match: # Blacklisted
-            log_info('{0}-BLACKLIST-RX-REFUSED: \"{1}\" -> \"{2}\"'.format(valuetype, testvalue, match.group(0)))
+            log_info('{0}-BLACKLIST-RX: \"{1}\" -> \"{2}\"'.format(valuetype, testvalue, match.group(0)))
             return True
 
     return None
@@ -226,7 +241,7 @@ def check_dom(valuetype, testvalue, domlist, listname):
 
         # Check if Domain Whitelisted
         if fqdn in domlist:
-            log_info('{0}-{1}-DOM-REFUSED: \"{2}\" -> \"{3}\"'.format(valuetype, listname, testvalue, fqdn))
+            log_info('{0}-{1}-DOMAIN: \"{2}\" -> \"{3}\"'.format(valuetype, listname, testvalue, fqdn))
             return fqdn
 
     return False
@@ -234,7 +249,7 @@ def check_dom(valuetype, testvalue, domlist, listname):
 def check_ip(valuetype, testvalue, orgtestvalue, iplist, listname, rc):
     '''Check if IP is listed'''
     if testvalue in iplist:
-        log_info('{0}-{1}-IP-REFUSED: {2} -> {3}'.format(valuetype, listname, orgtestvalue, iplist.get_key(testvalue)))
+        log_info('{0}-{1}-IP-DOMAIN: {2} -> {3}'.format(valuetype, listname, orgtestvalue, iplist.get_key(testvalue)))
         return True
 
     return False
@@ -271,6 +286,7 @@ def init(id, cfg):
     #global bl_rx
     global wl_big_rx
     global bl_big_rx
+    global cache
 
     # Init Lists
     config = dict()
@@ -282,6 +298,7 @@ def init(id, cfg):
     bl_ip6 = pytricia.PyTricia(28)
     wl_rx = set()
     bl_rx = set()
+    cache = dict()
 
     # CNAME Collapsing
     config['collapse'] = True
@@ -330,21 +347,15 @@ def operate(id, event, qstate, qdata):
         qname = qstate.qinfo.qname_str.lower()
         qclass = qstate.qinfo.qclass_str.upper()
         qtype = qstate.qinfo.qtype_str.upper()
-        okay = True
+
         if qclass == 'IN' and qtype != 'ANY':
-            if is_blacklisted(qname, 'QNAME', False):
-                okay = False
-        else:
-            okay = False
+            result = is_blacklisted(qname, 'QNAME', False)
+            if result is not True:
+                qstate.ext_state[id] = MODULE_WAIT_MODULE
+                return True
 
-        if okay:
-            # End of processing
-            qstate.ext_state[id] = MODULE_WAIT_MODULE
-            return True
-
-        #log_info('REQUEST-REFUSED: {0}/{1}/{2}'.format(qname, qclass, qtype))
         qstate.return_rcode = RCODE_REFUSED
-        qstate.ext_state[id] = MODULE_FINISHED
+        qstate.ext_state[id] = MODULE_FINISHED 
         return True
 
     elif event == MODULE_EVENT_MODDONE:
@@ -354,18 +365,15 @@ def operate(id, event, qstate, qdata):
             rc = rep.flags & 0xf
             if (rc == RCODE_NOERROR) or (rep.an_numrrsets > 0):
                 status = None
-                firstqname = True
                 rrs = list()
                 for rrset in range(0, rep.an_numrrsets):
                     rk = rep.rrsets[rrset].rk
                     rdtype = rk.type_str.upper()
                     if rdtype in ('A', 'AAAA', 'CNAME', 'MX', 'NS', 'PTR', 'SOA', 'SRV'):
                         rdname = rk.dname_str.lower()
-                        if firstqname is False:
-                            firstqname = True
-                            status = is_blacklisted(rdname, 'CHAIN-QNAME', False)
-                            if status is not None:
-                               break
+                        status = is_blacklisted(rdname, 'CHAIN-QNAME', False)
+                        if status is not None:
+                           break
 
                         rdttl = rep.ttl
                         data = rep.rrsets[rrset].entry.data
@@ -419,17 +427,16 @@ def operate(id, event, qstate, qdata):
                             rmsg.set_return_msg(qstate)
                             if not rmsg.set_return_msg(qstate):
                                 log_err('CNAME COLLAPSE ERROR: ' + str(rmsg.answer))
-                                qstate.return_rcode = RCODE_SERVFAIL
-                                qstate.ext_state[id] = MODULE_FINISHED
-                                return False
+                                qstate.ext_state[id] = MODULE_ERROR
+                                return True
 
                             # Allow changes
+                            qstate.return_rcode = RCODE_NOERROR
                             if qstate.return_msg.qinfo:
                                 invalidateQueryInCache(qstate, qstate.return_msg.qinfo)
                             qstate.no_cache_store = 0
                             storeQueryInCache(qstate, qstate.return_msg.qinfo, qstate.return_msg.rep, 0)
                             qstate.return_msg.rep.security = 2
-                            qstate.return_rcode = RCODE_NOERROR
 
                         log_info('COLLAPSED: {0}'.format(firstname))
 
@@ -439,6 +446,11 @@ def operate(id, event, qstate, qdata):
 
         # Block
         qstate.return_rcode = RCODE_REFUSED
+        if qstate.return_msg.qinfo:
+            invalidateQueryInCache(qstate, qstate.return_msg.qinfo)
+        qstate.no_cache_store = 0
+        storeQueryInCache(qstate, qstate.return_msg.qinfo, qstate.return_msg.rep, 0)
+        qstate.return_msg.rep.security = 2
         qstate.ext_state[id] = MODULE_FINISHED
         return True
 
