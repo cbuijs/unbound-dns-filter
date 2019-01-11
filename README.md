@@ -9,5 +9,6 @@ To-Do:
 
 - Documentation/Wiki.
 - RPZ feature to load RPZ DB-Style (BIND Syntax) zone either from file or via zone-transfer
+- Caching of response/rcodes other to NOERROR.
 - Optimizations of parsing response records
 - Debug logging.
