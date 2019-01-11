@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 '''
 =========================================================================================
- dns-filter.py: v0.07-20190111 Copyright (C) 2019 Chris Buijs <cbuijs@chrisbuijs.com>
+ dns-filter.py: v0.08-20190111 Copyright (C) 2019 Chris Buijs <cbuijs@chrisbuijs.com>
 =========================================================================================
 
  DNS filtering extension for the unbound DNS resolver.
@@ -220,12 +220,12 @@ def check_blacklisted(testvalue, valuetype, checkip):
     # Check against regex
     match = wl_big_rx.search(testvalue)
     if match: # Whitelisted
-        log_info('{0}-WHITELIST-RX: \"{1}\" -> \"{2}\"'.format(valuetype, testvalue, match.group(0)))
+        log_info('{0}-WHITELIST-REGEX: \"{1}\" -> \"{2}\"'.format(valuetype, testvalue, match.group(0)))
         return False
     else:
         match = bl_big_rx.search(testvalue)
         if match: # Blacklisted
-            log_info('{0}-BLACKLIST-RX: \"{1}\" -> \"{2}\"'.format(valuetype, testvalue, match.group(0)))
+            log_info('{0}-BLACKLIST-REGEX: \"{1}\" -> \"{2}\"'.format(valuetype, testvalue, match.group(0)))
             return True
 
     return None
@@ -429,7 +429,7 @@ def operate(id, event, qstate, qdata):
 
                             # Allow changes
                             qstate.return_rcode = RCODE_NOERROR
-                            if qstate.return_msg.qinfo:
+                            if qstate.return_msg:
                                 invalidateQueryInCache(qstate, qstate.return_msg.qinfo)
                             qstate.no_cache_store = 0
                             storeQueryInCache(qstate, qstate.return_msg.qinfo, qstate.return_msg.rep, 0)
@@ -443,7 +443,7 @@ def operate(id, event, qstate, qdata):
 
         # Block
         qstate.return_rcode = RCODE_REFUSED
-        if qstate.return_msg.qinfo:
+        if qstate.return_msg:
             invalidateQueryInCache(qstate, qstate.return_msg.qinfo)
         qstate.no_cache_store = 0
         storeQueryInCache(qstate, qstate.return_msg.qinfo, qstate.return_msg.rep, 0)
