@@ -11,8 +11,12 @@
 '''
 
 # Standard/Included modules
-import sys, os, os.path
+import sys, os, os.path, time
 sys.path.append("/usr/local/lib/python2.7/dist-packages/")
+
+# Data
+import json, struct
+import configparser
 
 # Use module regex instead of re, much faster less bugs
 import regex
@@ -26,12 +30,24 @@ import requests
 
 ##########################################################################################
 
-# Log
-def log(message, iserr=False):
-    if iserr:
-        log_err('[DNS-FILTER-ERROR]: {0}'.format(message))
-    else:
-        log_info('[DNS-FILTER]: {0}'.format(message))
+# Domain Regex
+is_dom = regex.compile('(?=^.{1,253}[a-z][\.]*$)(^((?!-)[a-z0-9_-]{0,62}[a-z0-9]\.)*(xn--[a-z0-9-]{1,59}|[a-z]{2,63})[\.]*$)', regex.I)
+
+# IP Regexes
+ip_rx4 = '((25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])(\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])){3}(/(3[0-2]|[12]?[0-9]))*)'
+ip_rx6 = '(((:(:[0-9a-f]{1,4}){1,7}|::|[0-9a-f]{1,4}(:(:[0-9a-f]{1,4}){1,6}|::|:[0-9a-f]{1,4}(:(:[0-9a-f]{1,4}){1,5}|::|:[0-9a-f]{1,4}(:(:[0-9a-f]{1,4}){1,4}|::|:[0-9a-f]{1,4}(:(:[0-9a-f]{1,4}){1,3}|::|:[0-9a-f]{1,4}(:(:[0-9a-f]{1,4}){1,2}|::|:[0-9a-f]{1,4}(::[0-9a-f]{1,4}|::|:[0-9a-f]{1,4}(::|:[0-9a-f]{1,4}))))))))|(:(:[0-9a-f]{1,4}){0,5}|[0-9a-f]{1,4}(:(:[0-9a-f]{1,4}){0,4}|:[0-9a-f]{1,4}(:(:[0-9a-f]{1,4}){0,3}|:[0-9a-f]{1,4}(:(:[0-9a-f]{1,4}){0,2}|:[0-9a-f]{1,4}(:(:[0-9a-f]{1,4})?|:[0-9a-f]{1,4}(:|:[0-9a-f]{1,4})))))):(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])(\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])){3})(/(12[0-8]|1[01][0-9]|[1-9]?[0-9]))*)'
+is_ip4 = regex.compile('^' + ip_rx4 + '$', regex.I)
+is_ip6 = regex.compile('^' + ip_rx6 + '$', regex.I)
+is_ip = regex.compile('^(' + ip_rx4 + '|' + ip_rx6 + ')$', regex.I)
+
+# IP Arpa Regexes
+ip4arpa_rx = '([0-9]{1,3}\.){4}in-addr'
+ip6arpa_rx = '([0-9a-f]\.){32}ip6'
+ip4arpa = regex.compile('^' + ip4arpa_rx + '\.arpa[\.]*$', regex.I)
+ip6arpa = regex.compile('^' + ip6arpa_rx + '\.arpa[\.]*$', regex.I)
+iparpa = regex.compile('^(' + ip4arpa_rx + '|' + ip6arpa_rx + ')\.arpa[\.]*$', regex.I)
+
+##########################################################################################
 
 # Decode names/strings from response message
 def decode_data(rawdata, start):
@@ -46,16 +62,194 @@ def decode_data(rawdata, start):
        text += c
     return text.lower()
 
-# Get DNS client IP
-def client_ip(qstate):
-    reply_list = qstate.mesh_info.reply_list
+# Get config
+def get_config(config, conffile):
+    section = 'UNBOUND-DNS-FILTER'
 
-    while reply_list:
-        if reply_list.query_reply:
-            return reply_list.query_reply.addr
-        reply_list = reply_list.next
+    pconfig = configparser.ConfigParser()
+    pconfig.sections()
+    pconfig.read(conffile)
 
-    return "0.0.0.0"
+    for key in pconfig[section]:
+        try:
+            config[key.lower()] = json.loads(pconfig.get(section, key))
+            #log_info('CONFIG-{0}: \"{1}\" = \"{2}\"'.format(str(type(config[key])).upper().split('\'')[1], key.lower(), config[key]))
+        except BaseException as err:
+            log_err('CONFIG-ERROR: Problem parsing \"{0}\" - {1}'.format(key.lower(), err))
+            log_err('ABORT!')
+            sys.exit(1)
+
+    return config
+
+def read_list(filenames, listname, domlst, ip4lst, ip6lst, rxlst):
+    for filename in filenames:
+        lines = get_lines(filename, listname)
+
+        if lines:
+            count = 0
+            for line in lines:
+                count += 1
+                entry = regex.split('\s*#\s*', line.replace('\r', '').replace('\n', ''))[0].strip() # Strip comments and line-feeds
+                if entry:
+                    if is_ip4.search(entry):
+                        ip4lst[entry] = entry
+
+                    elif is_ip6.search(entry):
+                        ip6lst[entry] = entry
+
+                    elif is_dom.search(entry):
+                        domlst[entry.strip('.').lower() + '.'] = entry
+
+                    else:
+                        try:
+                            rx = regex.compile(entry, regex.I) # To test/validate
+                            #rxlst[rx] = entry
+                            rxlst.add(entry)
+                        except BaseException as err:
+                            log_err('LIST [#{0}]: Invalid Syntax: \"{1}\"'.format(count, line))
+
+
+    log_info('LIST-TOTALS [{0}]: {1} Domains, {2} IPv4-Addresses, {3} IPv6-Addresses and {4} Regexes'.format(listname, len(domlst), len(ip4lst), len(ip6lst), len(rxlst)))
+    return domlst, ip4lst, ip6lst, rxlst
+
+def file_exist(file, isdb):
+    if file:
+        try:
+            if os.path.isfile(file):
+                fstat = os.stat(file)
+                fsize = fstat.st_size
+                if fsize > 0: # File-size must be greater then zero
+                    mtime = int(fstat.st_mtime)
+                    currenttime = int(time.time())
+                    age = int(currenttime - mtime)
+                    #log_info('FILE-EXIST: {0} = {1} seconds old'.format(file, age))
+                    return age
+                #else:
+                    #log_info('FILE-EXIST: {0} is zero size'.format(file))
+
+        except BaseException as err:
+            log_err('FILE-EXIST-ERROR: {0}'.format(err))
+            return False
+
+    return False
+
+def get_lines(filename, listname):
+    log_info('READ-LIST: {0} - {1}'.format(filename, listname))
+    lines = False
+
+    if filename.startswith('http://') or filename.startswith('https://'):
+        log_info('FETCH: Downloading \"{0}\" from URL \"{1}\"'.format(listname, filename))
+        headers = {'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/63.0.3239.132 Safari/537.36'}
+        try:
+            r = requests.get(filename, timeout=10, headers=headers, allow_redirects=True)
+            if r.status_code == 200:
+                lines = r.text.splitlines()
+            else:
+                log_err('ERROR: Unable to download from \"{0}\" ({1})'.format(filename, r.status_code))
+
+        except BaseException as err:
+            log_err('ERROR: Unable to download from \"{0}\" ({1})'.format(filename, err))
+
+    elif file_exist(filename, False):
+        log_info('FETCH: Fetching \"{0}\" from file \"{1}\"'.format(listname, filename))
+        try:
+            f = open(filename, 'r')
+            lines = f.read().splitlines()
+            f.close()
+
+        except BaseException as err:
+            log_err('ERROR: Unable to open/read/process file \"{0}\" - {1}'.format(filename, err))
+            return False
+
+    return lines
+
+def is_blacklisted(testvalue, valuetype, checkip):
+    orgtestvalue = testvalue
+    # Check against domain
+    if is_dom.search(testvalue):
+        if check_dom(valuetype, testvalue, wl_dom, 'WHITELIST'): # Whitelisted
+            return False
+
+        elif check_dom(valuetype, testvalue, bl_dom, 'BLACKLIST'): # Blacklisted
+            return True
+
+        # Check if Domain is a rev-arpa domain, if it is, check its IP value
+        ip = False
+        if ip4arpa.search(testvalue):
+            ip = '.'.join(testvalue.strip('.').split('.')[0:4][::-1]) # IPv4
+        elif ip6arpa.search(testvalue):
+            ip = ':'.join(filter(None, regex.split('(.{4,4})', ''.join(testvalue.strip('.').split('.')[0:32][::-1])))) # IPv6
+
+        if ip:
+            checkip = True
+            testvalue = ip
+
+    # Check against IP4
+    if checkip and is_ip4.search(testvalue):
+        # Check if IPv4 is whitelisted
+        if check_ip(valuetype, testvalue, orgtestvalue, wl_ip4, 'WHITELIST', False):
+            return False
+        # Check if IPv4 is blacklisted
+        elif check_ip(valuetype, testvalue, orgtestvalue, bl_ip4, 'BLACKLIST', True):
+            return True
+
+    # Check against IP6
+    elif checkip and is_ip6.search(testvalue):
+        # Check if IPv6 is whitelisted
+        if check_ip(valuetype, testvalue, orgtestvalue, wl_ip6, 'WHITELIST', False):
+            return False
+        # Check if IPv6 is blacklisted
+        elif check_ip(valuetype, testvalue, orgtestvalue, bl_ip6, 'BLACKLIST', True):
+            return True
+
+    # Check against regex
+    match = wl_big_rx.search(testvalue)
+    if match: # Whitelisted
+        log_info('{0}-WHITELIST-RX-REFUSED: \"{1}\" -> \"{2}\"'.format(valuetype, testvalue, match.group(0)))
+        return False
+    else:
+        match = bl_big_rx.search(testvalue)
+        if match: # Blacklisted
+            log_info('{0}-BLACKLIST-RX-REFUSED: \"{1}\" -> \"{2}\"'.format(valuetype, testvalue, match.group(0)))
+            return True
+
+    return None
+
+def check_dom(valuetype, testvalue, domlist, listname):
+    '''Match domain against list, works for subdomains to'''
+    fqdn = False
+    for label in filter(None, testvalue.split('.')[::-1]):
+        if fqdn:
+            fqdn = label + '.' + fqdn
+        else:
+            fqdn = label + '.'
+
+        # Check if Domain Whitelisted
+        if fqdn in domlist:
+            log_info('{0}-{1}-DOM-REFUSED: \"{2}\" -> \"{3}\"'.format(valuetype, listname, testvalue, fqdn))
+            return fqdn
+
+    return False
+
+def check_ip(valuetype, testvalue, orgtestvalue, iplist, listname, rc):
+    '''Check if IP is listed'''
+    if testvalue in iplist:
+        log_info('{0}-{1}-IP-REFUSED: {2} -> {3}'.format(valuetype, listname, orgtestvalue, iplist.get_key(testvalue)))
+        return True
+
+    return False
+
+def fix_cache(msg, qstate):
+    msg.set_return_msg(qstate)
+    if qstate.return_msg.qinfo:
+        invalidateQueryInCache(qstate, qstate.return_msg.qinfo)
+
+    qstate.no_cache_store = 0
+    storeQueryInCache(qstate, qstate.return_msg.qinfo, qstate.return_msg.rep, 0)
+
+    qstate.return_msg.rep.security = 2
+
+    return qstate
 
 ##########################################################################################
 # UNBOUND DEFS START
@@ -63,17 +257,66 @@ def client_ip(qstate):
 
 # Initialization
 def init(id, cfg):
-    log('Initializing ...')
+    log_info('Initializing ...')
 
-    # Read Lists
+    # Global vars
+    global config
+    global wl_dom
+    global bl_dom
+    global wl_ip4
+    global bl_ip4
+    global wl_ip6
+    global bl_ip6
+    #global wl_rx
+    #global bl_rx
+    global wl_big_rx
+    global bl_big_rx
 
-    log('Initializing Finished')
+    # Init Lists
+    config = dict()
+    wl_dom = dict()
+    bl_dom = dict()
+    wl_ip4 = pytricia.PyTricia(32)
+    bl_ip4 = pytricia.PyTricia(32)
+    wl_ip6 = pytricia.PyTricia(28)
+    bl_ip6 = pytricia.PyTricia(28)
+    wl_rx = set()
+    bl_rx = set()
+
+    # CNAME Collapsing
+    config['collapse'] = True
+
+    # Block IP Families
+    config['blockip4'] = False
+    config['blockip6'] = True
+
+    # White/Blacklists
+    # See: https://github.com/cbuijs/accomplist/tree/master/standard
+    config['whitelist'] = ["/opt/accomplist/standard/plain.white.domain.list", "/opt/accomplist/standard/plain.white.ip4cidr.list", "/opt/accomplist/standard/plain.white.ip6cidr.list", "/opt/accomplist/standard/plain.white.regex.list"]
+    config['blacklist'] = ["/opt/accomplist/standard/plain.black.domain.list", "/opt/accomplist/standard/plain.black.ip4cidr.list", "/opt/accomplist/standard/plain.black.ip6cidr.list", "/opt/accomplist/standard/plain.black.regex.list"]
+
+    # Get config
+    config = get_config(config, '/opt/unbound-dns-filter/unbound-dns-filter.conf')
+
+    # Read lists
+    wl_dom, wl_ip4, wl_ip6, wl_rx = read_list(config['whitelist'], 'WhiteList', wl_dom, wl_ip4, wl_ip6, wl_rx)
+    bl_dom, bl_ip4, bl_ip6, bl_rx = read_list(config['blacklist'], 'BlackList', bl_dom, bl_ip4, bl_ip6, bl_rx)
+
+    # Create combined regex for speed
+    try:
+        wl_big_rx = regex.compile('|'.join('(?:{0})'.format(x) for x in wl_rx), regex.I)
+        bl_big_rx = regex.compile('|'.join('(?:{0})'.format(x) for x in bl_rx), regex.I)
+    except BaseException as err:
+        log_err('BIG-REGEX-COMPILE-ERROR: {0}'.format(err))
+
+    log_info('Initializing Finished')
+
     return True
 
 # Unload/Finish-up
 def deinit(id):
-    log('Shutting down ...')
-    log('DONE!')
+    log_info('Shutting down ...')
+    log_info('DONE!')
     return True
 
 # Inform_Super
@@ -87,17 +330,21 @@ def operate(id, event, qstate, qdata):
         qname = qstate.qinfo.qname_str.lower()
         qclass = qstate.qinfo.qclass_str.upper()
         qtype = qstate.qinfo.qtype_str.upper()
+        okay = True
         if qclass == 'IN' and qtype != 'ANY':
-            log('REQUEST [{0}]: {1}/{2}/{3}'.format(id, qname, qclass, qtype))
-
+            if is_blacklisted(qname, 'QNAME', False):
+                okay = False
         else:
-            log('REQUEST-REFUSED [{0}]: {1}/{2}/{3}'.format(id, qname, qclass, qtype))
-            qstate.return_rcode = RCODE_REFUSED
-            qstate.ext_state[id] = MODULE_FINISHED
+            okay = False
+
+        if okay:
+            # End of processing
+            qstate.ext_state[id] = MODULE_WAIT_MODULE
             return True
 
-        # Pass on
-        qstate.ext_state[id] = MODULE_WAIT_MODULE
+        #log_info('REQUEST-REFUSED: {0}/{1}/{2}'.format(qname, qclass, qtype))
+        qstate.return_rcode = RCODE_REFUSED
+        qstate.ext_state[id] = MODULE_FINISHED
         return True
 
     elif event == MODULE_EVENT_MODDONE:
@@ -106,11 +353,19 @@ def operate(id, event, qstate, qdata):
             rep = msg.rep
             rc = rep.flags & 0xf
             if (rc == RCODE_NOERROR) or (rep.an_numrrsets > 0):
+                status = None
+                firstqname = True
                 for rrset in range(0, rep.an_numrrsets):
                     rk = rep.rrsets[rrset].rk
                     rdtype = rk.type_str.upper()
                     if rdtype in ('A', 'AAAA', 'CNAME', 'MX', 'NS', 'PTR', 'SOA', 'SRV'):
                         rdname = rk.dname_str.lower()
+                        if firstqname is False:
+                            firstqname = True
+                            status = is_blacklisted(rdname, 'CHAIN-QNAME', False)
+                            if status is not None:
+                               break
+
                         data = rep.rrsets[rrset].entry.data
                         countrr = 0
                         for rr in range(0, data.count):
@@ -132,14 +387,33 @@ def operate(id, event, qstate, qdata):
                                 rdata = decode_data(answer,5)
 
                             if rdata:
-                                log('RESPONSE [{0}]: {1}/{2}/{3}'.format(id, rdname, rdtype, rdata))
+                                status = is_blacklisted(rdata, 'DATA', True)
+                                if status is not None:
+                                    break
 
-        # All done
+                        if status is not None: # It is White or Blacklisted
+                            break
+
+                if status is not True: # Not blacklisted
+                    # Fix cache
+                    msg.set_return_msg(qstate)
+                    if qstate.return_msg.qinfo:
+                        invalidateQueryInCache(qstate, qstate.return_msg.qinfo)
+                    qstate.no_cache_store = 0
+                    storeQueryInCache(qstate, qstate.return_msg.qinfo, qstate.return_msg.rep, 0)
+                    qstate.return_msg.rep.security = 2
+
+                    # End of processing
+                    qstate.ext_state[id] = MODULE_FINISHED
+                    return True
+
+        # Block
+        qstate.return_rcode = RCODE_REFUSED
         qstate.ext_state[id] = MODULE_FINISHED
         return True
 
     # Oops, non-supported event
-    log('BAD Event {0}'.format(event), True)
+    log_info('BAD Event {0}'.format(event), True)
     qstate.ext_state[id] = MODULE_ERROR
 
     return False
