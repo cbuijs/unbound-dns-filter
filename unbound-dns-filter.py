@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 '''
 =========================================================================================
- dns-filter.py: v0.08-20190111 Copyright (C) 2019 Chris Buijs <cbuijs@chrisbuijs.com>
+ dns-filter.py: v0.15-20190111 Copyright (C) 2019 Chris Buijs <cbuijs@chrisbuijs.com>
 =========================================================================================
 
  DNS filtering extension for the unbound DNS resolver.
@@ -49,6 +49,26 @@ iparpa = regex.compile('^(' + ip4arpa_rx + '|' + ip6arpa_rx + ')\.arpa[\.]*$', r
 
 ##########################################################################################
 
+def get_data(rdtype, answer):
+    if rdtype == 'A':
+        rdata = "%d.%d.%d.%d"%(ord(answer[2]),ord(answer[3]),ord(answer[4]),ord(answer[5]))
+    elif rdtype == 'AAAA':
+        rdata = "%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x"%(ord(answer[2]),ord(answer[3]),ord(answer[4]),ord(answer[5]),ord(answer[6]),ord(answer[7]),ord(answer[8]),ord(answer[9]),ord(answer[10]),ord(answer[11]),ord(answer[12]),ord(answer[13]),ord(answer[14]),ord(answer[15]),ord(answer[16]),ord(answer[17]))
+    elif rdtype in ('CNAME', 'NS'):
+        rdata = decode_data(answer,0)
+    elif rdtype == 'MX':
+        rdata = decode_data(answer,1)
+    elif rdtype == 'PTR':
+        rdata = decode_data(answer,0)
+    elif rdtype == 'SOA':
+        rdata = decode_data(answer,0).split(' ')[0][0]
+    elif rdtype == 'SRV':
+        rdata = decode_data(answer,5)
+    else:
+        rdata = False
+
+    return rdata
+
 # Decode names/strings from response message
 def decode_data(rawdata, start):
     text = ''
@@ -61,6 +81,66 @@ def decode_data(rawdata, start):
        remain -= 1
        text += c
     return text.lower()
+
+def rev_ip(ip, delimiter=None):
+    revip = False
+    eip = expand_ip(ip)
+    prefix = False
+
+    if '/' in eip:
+        eip, prefix = regex.split('/', eip)[0:2]
+    else:
+        if is_ip4.search(eip):
+            prefix = '32'
+        elif is_ip6.search(eip):
+            prefix = '128'
+
+    if prefix:
+        prefix = int(prefix)
+        if is_ip4.search(eip):
+            if prefix in (8, 16, 24, 32):
+                revip = '.'.join(eip.split('.')[0:int(prefix / 8)][::-1]) + '.in-addr.arpa.'
+            elif delimiter:
+                octs = eip.split('.')[::-1]
+                octs[3 - int(prefix / 8)] = octs[3 - int(prefix / 8)] + delimiter + str(prefix)
+                revip = '.'.join(octs[3 - int(prefix / 8):]) + '.in-addr.arpa.'
+
+        elif is_ip6.search(eip):
+            if prefix in (4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60, 64, 68, 72, 76, 80, 84, 88, 92, 96, 100, 104, 108, 112, 116, 120, 124, 128):
+                revip = '.'.join(filter(None, regex.split('(.)', regex.sub(':', '', eip))))[0:(prefix / 4) * 2][::-1].strip('.') + '.ip6.arpa.'
+            elif delimiter:
+                nibs = filter(None, regex.split('(.)', regex.sub(':', '', eip)))[::-1]
+                nibs[31 - int(prefix / 4)] = nibs[31 - int(prefix /4)] + delimiter + str(prefix)
+                revip = '.'.join(nibs[31 - int(prefix /4):]) + '.ip6.arpa.'
+
+    return revip
+
+def expand_ip(ip):
+    if not is_ip6.search(ip):
+        return ip
+
+    new_ip = ip
+
+    prefix = False
+    if '/' in new_ip:
+        new_ip, prefix = new_ip.split('/')[0:2]
+        if new_ip.endswith(':'):
+            new_ip = new_ip + '0'
+
+    if '::' in new_ip:
+        padding = 9 - new_ip.count(':')
+        new_ip = new_ip.replace(('::'), ':' * padding)
+
+    parts = new_ip.split(':')
+    for part in range(8):
+        parts[part] = str(parts[part]).zfill(4)
+
+    new_ip = ':'.join(parts)
+
+    if prefix:
+        new_ip = new_ip + '/' + prefix
+
+    return new_ip
 
 # Get config
 def get_config(config, conffile):
@@ -249,22 +329,20 @@ def check_dom(valuetype, testvalue, domlist, listname):
 def check_ip(valuetype, testvalue, orgtestvalue, iplist, listname, rc):
     '''Check if IP is listed'''
     if testvalue in iplist:
-        log_info('{0}-{1}-IP-DOMAIN: {2} -> {3}'.format(valuetype, listname, orgtestvalue, iplist.get_key(testvalue)))
+        if orgtestvalue != testvalue:
+            log_info('{0}-{1}-IP: {2} -> {3} -> {4}'.format(valuetype, listname, orgtestvalue, testvalue, iplist.get_key(testvalue)))
+            log_info('{0}-{1}-IP-ADD-DOMAIN: {2} ({3})'.format(valuetype, listname, orgtestvalue, testvalue))
+            cache[orgtestvalue] = rc
+        else:
+            log_info('{0}-{1}-IP: {2} -> {3}'.format(valuetype, listname, orgtestvalue, iplist.get_key(testvalue)))
+            iprev = rev_ip(testvalue)
+            if iprev:
+                log_info('{0}-{1}-IP-ADD-ARPA: {2} ({3})'.format(valuetype, listname, iprev, testvalue))
+                cache[iprev] = rc
+
         return True
 
     return False
-
-def fix_cache(msg, qstate):
-    msg.set_return_msg(qstate)
-    if qstate.return_msg.qinfo:
-        invalidateQueryInCache(qstate, qstate.return_msg.qinfo)
-
-    qstate.no_cache_store = 0
-    storeQueryInCache(qstate, qstate.return_msg.qinfo, qstate.return_msg.rep, 0)
-
-    qstate.return_msg.rep.security = 2
-
-    return qstate
 
 ##########################################################################################
 # UNBOUND DEFS START
@@ -302,6 +380,9 @@ def init(id, cfg):
 
     # CNAME Collapsing
     config['collapse'] = True
+
+    # Equalize TTLS among RRs in RRSETs
+    config['equalizettl'] = True
 
     # Block IP Families
     config['blockip4'] = False
@@ -347,14 +428,33 @@ def operate(id, event, qstate, qdata):
         qname = qstate.qinfo.qname_str.lower()
         qclass = qstate.qinfo.qclass_str.upper()
         qtype = qstate.qinfo.qtype_str.upper()
+        rc = RCODE_REFUSED
 
         if qclass == 'IN' and qtype != 'ANY':
-            result = is_blacklisted(qname, 'QNAME', False)
-            if result is not True:
-                qstate.ext_state[id] = MODULE_WAIT_MODULE
-                return True
+            if config['blockip4'] and (qtype == 'A' or (qtype == 'PTR' and qname.endswith('.in-addr.arpa.'))):
+               log_info('BLOCK-IPV4: {0}/{1}'.format(qname, qtype))
+            elif config['blockip6'] and (qtype == 'AAAA' or (qtype == 'PTR' and qname.endswith('.ip6.arpa.'))):
+               log_info('BLOCK-IPV6: {0}/{1}'.format(qname, qtype))
+               rc = RCODE_NOERROR # Search-domain workaround
+            else:
+               result = is_blacklisted(qname, 'QNAME', False)
+               if result is not True:
+                   qstate.ext_state[id] = MODULE_WAIT_MODULE
+                   return True
+        else:
+           rc = RCODE_REFUSED
 
-        qstate.return_rcode = RCODE_REFUSED
+        # Build REFUSE answer and cache
+        rmsg = DNSMessage(qname, qstate.qinfo.qtype, RR_CLASS_IN, PKT_QR | PKT_RA )
+        rmsg.set_return_msg(qstate)
+        qstate.return_rcode = rc
+        if not rmsg.set_return_msg(qstate):
+            log_err('QUERY MESSAGE ERROR: ' + str(rmsg.answer))
+            qstate.ext_state[id] = MODULE_ERROR
+            return True
+        qstate.no_cache_store = 0
+        storeQueryInCache(qstate, qstate.return_msg.qinfo, qstate.return_msg.rep, 0)
+        qstate.return_msg.rep.security = 2
         qstate.ext_state[id] = MODULE_FINISHED 
         return True
 
@@ -364,8 +464,8 @@ def operate(id, event, qstate, qdata):
             rep = msg.rep
             repttl = rep.ttl
             rc = rep.flags & 0xf
-            if (rc == RCODE_NOERROR) or (rep.an_numrrsets > 0):
-                status = None
+            status = None
+            if (rc == RCODE_NOERROR) and (rep.an_numrrsets > 0):
                 rrs = list()
                 for rrset in range(0, rep.an_numrrsets):
                     rk = rep.rrsets[rrset].rk
@@ -377,39 +477,30 @@ def operate(id, event, qstate, qdata):
                            break
 
                         data = rep.rrsets[rrset].entry.data
+
+                        # Equalize TTLS
+                        if config['equalizettl']:
+                            for rr in range(0, data.count):
+                                data.rr_ttl[rr] = repttl
+
+                        # Check data
                         countrr = 0
                         for rr in range(0, data.count):
                             answer = data.rr_data[rr]
-                            rdttl = data.rr_ttl[rr]
-                            rdata = False
-                            if rdtype == 'A':
-                                rdata = "%d.%d.%d.%d"%(ord(answer[2]),ord(answer[3]),ord(answer[4]),ord(answer[5]))
-                            elif rdtype == 'AAAA':
-                                rdata = "%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x:%02x%02x"%(ord(answer[2]),ord(answer[3]),ord(answer[4]),ord(answer[5]),ord(answer[6]),ord(answer[7]),ord(answer[8]),ord(answer[9]),ord(answer[10]),ord(answer[11]),ord(answer[12]),ord(answer[13]),ord(answer[14]),ord(answer[15]),ord(answer[16]),ord(answer[17]))
-                            elif rdtype in ('CNAME', 'NS'):
-                                rdata = decode_data(answer,0)
-                            elif rdtype == 'MX':
-                                rdata = decode_data(answer,1)
-                            elif rdtype == 'PTR':
-                                rdata = decode_data(answer,0)
-                            elif rdtype == 'SOA':
-                                rdata = decode_data(answer,0).split(' ')[0][0]
-                            elif rdtype == 'SRV':
-                                rdata = decode_data(answer,5)
-
+                            #rdttl = data.rr_ttl[rr]
+                            rdata = get_data(rdtype, answer)
                             if rdata:
                                 status = is_blacklisted(rdata, 'DATA', True)
                                 if status is not None:
                                     break
 
-                            rrs.append((rdname, rdttl, rdtype, rdata))
+                            rrs.append((rdname, repttl, rdtype, rdata))
 
                         if status is not None: # It is White or Blacklisted
                             break
 
                 if status is not True: # Not white/blacklisted
                     if config['collapse'] and status is None and rrs and rrs[0][2] == 'CNAME':
-                        lastttl = rrs[-1][1]
                         firstname = rrs[0][0]
 
                         if rrs[-1][2] == 'A':
@@ -419,7 +510,7 @@ def operate(id, event, qstate, qdata):
 
                         for rr in rrs:
                             if rr[2] == rrs[-1][2]:
-                                rmsg.answer.append('{0} {1} IN {2} {3}'.format(firstname, lastttl, rr[2], rr[3]))
+                                rmsg.answer.append('{0} {1} IN {2} {3}'.format(firstname, repttl, rr[2], rr[3]))
 
                             rmsg.set_return_msg(qstate)
                             if not rmsg.set_return_msg(qstate):
@@ -427,28 +518,31 @@ def operate(id, event, qstate, qdata):
                                 qstate.ext_state[id] = MODULE_ERROR
                                 return True
 
-                            # Allow changes
-                            qstate.return_rcode = RCODE_NOERROR
-                            if qstate.return_msg.qinfo:
-                                invalidateQueryInCache(qstate, qstate.return_msg.qinfo)
-                            qstate.no_cache_store = 0
-                            storeQueryInCache(qstate, qstate.return_msg.qinfo, qstate.return_msg.rep, 0)
-                            qstate.return_msg.rep.security = 2
-
                         log_info('COLLAPSED: {0}'.format(firstname))
+            else:
+                qstate.return_rcode = rc
 
-                    # End of processing
-                    qstate.ext_state[id] = MODULE_FINISHED
-                    return True
+            if status is not True:
+                # Allow changes and cache
+                qstate.return_rcode = RCODE_NOERROR
+                if qstate.return_msg.qinfo:
+                    invalidateQueryInCache(qstate, qstate.return_msg.qinfo)
+                qstate.no_cache_store = 0
+                storeQueryInCache(qstate, qstate.return_msg.qinfo, qstate.return_msg.rep, 0)
+                qstate.return_msg.rep.security = 2
 
-        # Block
+                # End of processing
+                qstate.ext_state[id] = MODULE_FINISHED
+                return True
+
+        else:
+            log_err('RESPONSE NO MESSAGE')
+            qstate.ext_state[id] = MODULE_ERROR
+            return True
+
+        # Refuse
         qstate.return_rcode = RCODE_REFUSED
-        if qstate.return_msg.qinfo:
-            invalidateQueryInCache(qstate, qstate.return_msg.qinfo)
-        qstate.no_cache_store = 0
-        storeQueryInCache(qstate, qstate.return_msg.qinfo, qstate.return_msg.rep, 0)
-        qstate.return_msg.rep.security = 2
-        qstate.ext_state[id] = MODULE_FINISHED
+        qstate.ext_state[id] = MODULE_FINISHED 
         return True
 
     # Oops, non-supported event
