@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 '''
 =========================================================================================
- dns-filter.py: v0.01-20190111 Copyright (C) 2019 Chris Buijs <cbuijs@chrisbuijs.com>
+ dns-filter.py: v0.02-20190111 Copyright (C) 2019 Chris Buijs <cbuijs@chrisbuijs.com>
 =========================================================================================
 
  DNS filtering extension for the unbound DNS resolver.
@@ -355,6 +355,7 @@ def operate(id, event, qstate, qdata):
             if (rc == RCODE_NOERROR) or (rep.an_numrrsets > 0):
                 status = None
                 firstqname = True
+                rrs = list()
                 for rrset in range(0, rep.an_numrrsets):
                     rk = rep.rrsets[rrset].rk
                     rdtype = rk.type_str.upper()
@@ -366,6 +367,7 @@ def operate(id, event, qstate, qdata):
                             if status is not None:
                                break
 
+                        rdttl = rep.ttl
                         data = rep.rrsets[rrset].entry.data
                         countrr = 0
                         for rr in range(0, data.count):
@@ -391,21 +393,51 @@ def operate(id, event, qstate, qdata):
                                 if status is not None:
                                     break
 
+                            rrs.append((rdname, rdttl, rdtype, rdata))
+
                         if status is not None: # It is White or Blacklisted
                             break
 
                 if status is not True: # Not blacklisted
+                    if rrs:
+                        for rr in rrs:
+                            log_info('RESPONSE: {0} {1} IN {2} {3}'.format(rr[0], rr[1], rr[2], rr[3]))
+
+                    if config['collapse'] and rrs and rrs[0][2] == 'CNAME':
+                        lastttl = rrs[-1][1]
+                        firstname = rrs[0][0]
+
+                        if rrs[-1][2] == 'A':
+                            rmsg = DNSMessage(firstname, RR_TYPE_A, RR_CLASS_IN, PKT_QR | PKT_RA )
+                        else:
+                            rmsg = DNSMessage(firstname, RR_TYPE_AAAA, RR_CLASS_IN, PKT_QR | PKT_RA )
+
+                        for rr in rrs:
+                            if rr[2] == rrs[-1][2]:
+                                rmsg.answer.append('{0} {1} IN {2} {3}'.format(firstname, lastttl, rr[2], rr[3]))
+
+                            rmsg.set_return_msg(qstate)
+                            if not rmsg.set_return_msg(qstate):
+                                log_err('CNAME COLLAPSE ERROR: ' + str(rmsg.answer))
+                                qstate.return_rcode = RCODE_SERVFAIL
+                                qstate.ext_state[id] = MODULE_FINISHED
+                                return False
+
+                            # Allow changes
+                            if qstate.return_msg.qinfo:
+                                invalidateQueryInCache(qstate, qstate.return_msg.qinfo)
+                            qstate.no_cache_store = 0
+                            storeQueryInCache(qstate, qstate.return_msg.qinfo, qstate.return_msg.rep, 0)
+                            qstate.return_msg.rep.security = 2
+                            qstate.return_rcode = RCODE_NOERROR
+
+                        log_info('COLLAPSED: {0}'.format(firstname))
+
                     # End of processing
                     qstate.ext_state[id] = MODULE_FINISHED
                     return True
 
         # Block
-        msg.set_return_msg(qstate)
-        if qstate.return_msg.qinfo:
-            invalidateQueryInCache(qstate, qstate.return_msg.qinfo)
-        qstate.no_cache_store = 0
-        storeQueryInCache(qstate, qstate.return_msg.qinfo, qstate.return_msg.rep, 0)
-        qstate.return_msg.rep.security = 2
         qstate.return_rcode = RCODE_REFUSED
         qstate.ext_state[id] = MODULE_FINISHED
         return True
