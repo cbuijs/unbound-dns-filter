@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 '''
 =========================================================================================
- dns-filter.py: v0.06-20190111 Copyright (C) 2019 Chris Buijs <cbuijs@chrisbuijs.com>
+ dns-filter.py: v0.07-20190111 Copyright (C) 2019 Chris Buijs <cbuijs@chrisbuijs.com>
 =========================================================================================
 
  DNS filtering extension for the unbound DNS resolver.
@@ -362,6 +362,7 @@ def operate(id, event, qstate, qdata):
         msg = qstate.return_msg
         if msg:
             rep = msg.rep
+            repttl = rep.ttl
             rc = rep.flags & 0xf
             if (rc == RCODE_NOERROR) or (rep.an_numrrsets > 0):
                 status = None
@@ -375,11 +376,11 @@ def operate(id, event, qstate, qdata):
                         if status is not None:
                            break
 
-                        rdttl = rep.ttl
                         data = rep.rrsets[rrset].entry.data
                         countrr = 0
                         for rr in range(0, data.count):
                             answer = data.rr_data[rr]
+                            rdttl = data.rr_ttl[rr]
                             rdata = False
                             if rdtype == 'A':
                                 rdata = "%d.%d.%d.%d"%(ord(answer[2]),ord(answer[3]),ord(answer[4]),ord(answer[5]))
@@ -406,12 +407,8 @@ def operate(id, event, qstate, qdata):
                         if status is not None: # It is White or Blacklisted
                             break
 
-                if status is not True: # Not blacklisted
-                    if rrs:
-                        for rr in rrs:
-                            log_info('RESPONSE: {0} {1} IN {2} {3}'.format(rr[0], rr[1], rr[2], rr[3]))
-
-                    if config['collapse'] and rrs and rrs[0][2] == 'CNAME':
+                if status is not True: # Not white/blacklisted
+                    if config['collapse'] and status is None and rrs and rrs[0][2] == 'CNAME':
                         lastttl = rrs[-1][1]
                         firstname = rrs[0][0]
 
