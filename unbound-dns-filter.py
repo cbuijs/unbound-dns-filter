@@ -2,14 +2,13 @@
 # -*- coding: utf-8 -*-
 '''
 =========================================================================================
- dns-filter.py: v0.15-20190111 Copyright (C) 2019 Chris Buijs <cbuijs@chrisbuijs.com>
+ dns-filter.py: v0.20-20190112 Copyright (C) 2019 Chris Buijs <cbuijs@chrisbuijs.com>
 =========================================================================================
 
  DNS filtering extension for the unbound DNS resolver.
 
 =========================================================================================
 '''
-
 # Standard/Included modules
 import sys, os, os.path, time
 sys.path.append("/usr/local/lib/python2.7/dist-packages/")
@@ -24,9 +23,11 @@ import regex
 # Use module pytricia to find ip's in CIDR's dicts fast
 import pytricia
 
+# Use CacheTools TTLCache for cache
+from cachetools import TTLCache
+
 # Use requests module for downloading lists
 import requests
-
 
 ##########################################################################################
 
@@ -73,7 +74,7 @@ def get_data(rdtype, answer):
 def decode_data(rawdata, start):
     text = ''
     remain = ord(rawdata[2])
-    for c in rawdata[3+start:]:
+    for c in rawdata[3 + start:]:
        if remain == 0:
            text += '.'
            remain = ord(c)
@@ -81,6 +82,18 @@ def decode_data(rawdata, start):
        remain -= 1
        text += c
     return text.lower()
+
+def update_cache(name, status):
+    if name in cache:
+        return False
+
+    if status is True:
+        log_info('UPDATE-CACHE: {0} is BLACKLISTED'.format(name))
+    elif status is False:
+        log_info('UPDATE-CACHE: {0} is WHITELISTED'.format(name))
+    cache[name] = status
+
+    return True
 
 def rev_ip(ip, delimiter=None):
     revip = False
@@ -175,7 +188,7 @@ def read_list(filenames, listname, domlst, ip4lst, ip6lst, rxlst):
                         ip4lst[entry] = entry
 
                     elif is_ip6.search(entry):
-                        ip6lst[entry] = entry
+                        ip6lst[entry] = entry.lower()
 
                     elif is_dom.search(entry):
                         domlst[entry.strip('.').lower() + '.'] = entry
@@ -254,7 +267,7 @@ def is_blacklisted(value, valuetype, checkip):
         return result
 
     result = check_blacklisted(testvalue, valuetype, checkip)
-    cache[testvalue] = result
+    update_cache(testvalue, result)
     return result
 
 def check_blacklisted(testvalue, valuetype, checkip):
@@ -332,13 +345,13 @@ def check_ip(valuetype, testvalue, orgtestvalue, iplist, listname, rc):
         if orgtestvalue != testvalue:
             log_info('{0}-{1}-IP: {2} -> {3} -> {4}'.format(valuetype, listname, orgtestvalue, testvalue, iplist.get_key(testvalue)))
             log_info('{0}-{1}-IP-ADD-DOMAIN: {2} ({3})'.format(valuetype, listname, orgtestvalue, testvalue))
-            cache[orgtestvalue] = rc
+            update_cache(orgtestvalue, rc)
         else:
             log_info('{0}-{1}-IP: {2} -> {3}'.format(valuetype, listname, orgtestvalue, iplist.get_key(testvalue)))
             iprev = rev_ip(testvalue)
             if iprev:
                 log_info('{0}-{1}-IP-ADD-ARPA: {2} ({3})'.format(valuetype, listname, iprev, testvalue))
-                cache[iprev] = rc
+                update_cache(iprev, rc)
 
         return True
 
@@ -376,7 +389,9 @@ def init(id, cfg):
     bl_ip6 = pytricia.PyTricia(28)
     wl_rx = set()
     bl_rx = set()
-    cache = dict()
+
+    # Cache
+    cache = TTLCache(1024, 300) # Size and TTL
 
     # CNAME Collapsing
     config['collapse'] = True
@@ -441,20 +456,9 @@ def operate(id, event, qstate, qdata):
                if result is not True:
                    qstate.ext_state[id] = MODULE_WAIT_MODULE
                    return True
-        else:
-           rc = RCODE_REFUSED
 
-        # Build REFUSE answer and cache
-        rmsg = DNSMessage(qname, qstate.qinfo.qtype, RR_CLASS_IN, PKT_QR | PKT_RA )
-        rmsg.set_return_msg(qstate)
+        # REFUSE
         qstate.return_rcode = rc
-        if not rmsg.set_return_msg(qstate):
-            log_err('QUERY MESSAGE ERROR: ' + str(rmsg.answer))
-            qstate.ext_state[id] = MODULE_ERROR
-            return True
-        qstate.no_cache_store = 0
-        storeQueryInCache(qstate, qstate.return_msg.qinfo, qstate.return_msg.rep, 0)
-        qstate.return_msg.rep.security = 2
         qstate.ext_state[id] = MODULE_FINISHED 
         return True
 
@@ -492,6 +496,7 @@ def operate(id, event, qstate, qdata):
                             if rdata:
                                 status = is_blacklisted(rdata, 'DATA', True)
                                 if status is not None:
+                                    update_cache(rdname, status)
                                     break
 
                             rrs.append((rdname, repttl, rdtype, rdata))
@@ -524,23 +529,25 @@ def operate(id, event, qstate, qdata):
 
             if status is not True:
                 # Allow changes and cache
-                qstate.return_rcode = RCODE_NOERROR
+                #qstate.return_rcode = RCODE_NOERROR
                 if qstate.return_msg.qinfo:
                     invalidateQueryInCache(qstate, qstate.return_msg.qinfo)
                 qstate.no_cache_store = 0
-                storeQueryInCache(qstate, qstate.return_msg.qinfo, qstate.return_msg.rep, 0)
                 qstate.return_msg.rep.security = 2
-
-                # End of processing
+                storeQueryInCache(qstate, qstate.return_msg.qinfo, qstate.return_msg.rep, 0)
                 qstate.ext_state[id] = MODULE_FINISHED
                 return True
 
         else:
-            log_err('RESPONSE NO MESSAGE')
+            log_err('NO RESPONSE MESSAGE')
             qstate.ext_state[id] = MODULE_ERROR
             return True
 
         # Refuse
+        if qstate.return_msg.qinfo:
+            invalidateQueryInCache(qstate, qstate.return_msg.qinfo)
+        qstate.no_cache_store = 1
+        qstate.return_msg.rep.security = 2
         qstate.return_rcode = RCODE_REFUSED
         qstate.ext_state[id] = MODULE_FINISHED 
         return True
