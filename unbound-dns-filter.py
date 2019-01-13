@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 '''
 =========================================================================================
- dns-filter.py: v0.20-20190112 Copyright (C) 2019 Chris Buijs <cbuijs@chrisbuijs.com>
+ dns-filter.py: v0.30-20190113 Copyright (C) 2019 Chris Buijs <cbuijs@chrisbuijs.com>
 =========================================================================================
 
  DNS filtering extension for the unbound DNS resolver.
@@ -29,6 +29,9 @@ from cachetools import TTLCache
 # Use requests module for downloading lists
 import requests
 
+# TLDExtract
+import tldextract
+
 ##########################################################################################
 
 # Domain Regex
@@ -47,6 +50,9 @@ ip6arpa_rx = '([0-9a-f]\.){32}ip6'
 ip4arpa = regex.compile('^' + ip4arpa_rx + '\.arpa[\.]*$', regex.I)
 ip6arpa = regex.compile('^' + ip6arpa_rx + '\.arpa[\.]*$', regex.I)
 iparpa = regex.compile('^(' + ip4arpa_rx + '|' + ip6arpa_rx + ')\.arpa[\.]*$', regex.I)
+
+# Karma regex
+is_karma = regex.compile('^[a-z0-9_-]+:[0-9-]+$')
 
 ##########################################################################################
 
@@ -174,6 +180,40 @@ def get_config(config, conffile):
 
     return config
 
+def get_karma(klist, wlist, blist):
+    klist = karma_hits(klist, blist, False, 'BLACKLIST')
+    klist = karma_hits(klist, wlist, True, 'WHITELIST')
+    return klist
+
+def karma_hits(klist, domlist, negative, name):
+    log_info('KARMA: Creating {0} karmas'.format(name))
+    labels = dict()
+    for dom in domlist:
+        cleandom = filter(None, '.'.join(tldextract.extract(dom.rstrip('.'))[:2])).strip('.')
+        for label in filter(None, cleandom.split('.')):
+            if len(label) > 1 and (not regex.search('^(https*|ftps*|www[a-z]*)[0-9]*$', label)):
+                if label in labels:
+                    labels[label] += 1
+                else:
+                    labels[label] = 1
+
+            #log_info('KARMA-LABEL-{0}: {1} = {2}'.format(name, label, labels[label])) # Debugging
+
+    maxscore = max(labels.values())
+    #log_info('KARMA: Max-Score is {0}'.format(maxscore)) #Debug
+    for label in labels:
+        number = labels[label]
+        if number > maxscore / float(100):
+            score = number / float(maxscore)
+            score = int(round(score * 100, 0))
+            if score > 0:
+                if negative:
+                    score = 0 - score
+                klist[label] = score
+                #log_info('KARMA-LABEL [{0}]: {1} = {2}'.format(name, label, score)) # Debugging
+
+    return klist
+
 def read_list(filenames, listname, domlst, ip4lst, ip6lst, rxlst):
     for filename in filenames:
         lines = get_lines(filename, listname)
@@ -191,7 +231,11 @@ def read_list(filenames, listname, domlst, ip4lst, ip6lst, rxlst):
                         ip6lst[entry] = entry.lower()
 
                     elif is_dom.search(entry):
-                        domlst[entry.strip('.').lower() + '.'] = entry
+                        domlst[entry.strip('.').lower() + '.'] = entry.lower()
+                        #if tldextract.extract(entry)[2]:
+                        #    domlst[entry.strip('.').lower() + '.'] = entry
+                        #else:
+                        #    log_err('LIST [#{0}]: Invalid TLD: \"{1}\"'.format(count, line))
 
                     else:
                         try:
@@ -200,10 +244,34 @@ def read_list(filenames, listname, domlst, ip4lst, ip6lst, rxlst):
                             rxlst.add(entry)
                         except BaseException as err:
                             log_err('LIST [#{0}]: Invalid Syntax: \"{1}\"'.format(count, line))
-
+        else:
+            log_err('LIST: Empty file \"{0}\"'.format(filename))
 
     log_info('LIST-TOTALS [{0}]: {1} Domains, {2} IPv4-Addresses, {3} IPv6-Addresses and {4} Regexes'.format(listname, len(domlst), len(ip4lst), len(ip6lst), len(rxlst)))
     return domlst, ip4lst, ip6lst, rxlst
+
+def read_karma(filenames, listname, klist):
+    for filename in filenames:
+        lines = get_lines(filename, listname)
+        if lines:
+            count = 0
+            for line in lines:
+                count += 1
+                entry = regex.split('\s*#\s*', line.replace('\r', '').replace('\n', ''))[0].strip() # Strip comments and line-feeds
+                if entry:
+                    if is_karma.search(entry):
+                        elements = entry.split(':')
+                        label = elements[0].lower()
+                        score = elements[1]
+                        #if label in klist: #DEBUG
+                        #    log_info('KARMA-LIST: Overwrite score for {0}: {1} -> {2}'.format(label, klist[label], score))
+                        klist[label] = int(score)
+                    else:
+                        log_err('KARMALIST [#{0}]: Invalid KARMA: \"{1}\"'.format(count, line))
+        else:
+            log_err('KARMA-LIST: Empty file \"{0}\"'.format(filename))
+
+    return klist
 
 def file_exist(file, isdb):
     if file:
@@ -224,6 +292,7 @@ def file_exist(file, isdb):
             log_err('FILE-EXIST-ERROR: {0}'.format(err))
             return False
 
+    log_info('FILE-EXIST-ERROR: \"{0}\" file does not exist'.format(file))
     return False
 
 def get_lines(filename, listname):
@@ -273,24 +342,61 @@ def is_blacklisted(value, valuetype, checkip):
 def check_blacklisted(testvalue, valuetype, checkip):
     orgtestvalue = testvalue
 
-    # Check against domain
-    if is_dom.search(testvalue):
-        if check_dom(valuetype, testvalue, wl_dom, 'WHITELIST'): # Whitelisted
-            return False
-
-        elif check_dom(valuetype, testvalue, bl_dom, 'BLACKLIST'): # Blacklisted
+    # Domain based checks
+    if not is_ip.search(testvalue):
+        # Block non-existant TLDs
+        if not tldextract.extract(testvalue.rstrip('.'))[2]:
+            log_info('{0}-BLACKLIST-TLD: \"{1}\"'.format(valuetype, testvalue))
             return True
 
-        # Check if Domain is a rev-arpa domain, if it is, check its IP value
-        ip = False
-        if ip4arpa.search(testvalue):
-            ip = '.'.join(testvalue.strip('.').split('.')[0:4][::-1]) # IPv4
-        elif ip6arpa.search(testvalue):
-            ip = ':'.join(filter(None, regex.split('(.{4,4})', ''.join(testvalue.strip('.').split('.')[0:32][::-1])))) # IPv6
+        # Karma
+        if config['karmaenable']:
+            karmascore = 0
+            if testvalue in karmacache:
+                karmascore = karmacache.get(testvalue, 0)
+            else:
+                labels = filter(None, '.'.join(tldextract.extract(testvalue.rstrip('.'))[:2]).split('.'))
+                for label in labels:
+                    if len(label) > 1 and (not regex.search('^(https*|ftps*|www[a-z]*)[0-9]*$', label)):
+                        score = karma.get(label, 0)
+                        if score != 0:
+                            #log_info('{0}-KARMA-LABEL-SCORE: {1} - {2} - {3} = {4}'.format(valuetype, testvalue, cleanlabel, label, score)) # Debug
+                            if score < 0:
+                                karmascore = karmascore - abs(score)
+                            else:
+                                karmascore = karmascore + score
 
-        if ip:
-            checkip = True
-            testvalue = ip
+                #karmascore = int(round(karmascore / len(filter(None, testvalue.split('.'))),0)) # Take average score
+
+            if karmascore != 0:
+                karmacache[testvalue] = karmascore
+                if karmascore < 0: # Whitelisted
+                    log_info('{0}-KARMA-DOMAIN-WHITELIST: {1} = {2}'.format(valuetype, testvalue, karmascore))
+                    return False # !!! TESTING !!!
+                elif karmascore > config['karmathreshold']: # Blacklisted
+                    log_info('{0}-KARMA-DOMAIN-BLACKLIST: {1} = {2}'.format(valuetype, testvalue, karmascore))
+                    return True # !!! TESTING !!!
+                else:
+                    log_info('{0}-KARMA-SCORE: {1} = {2}'.format(valuetype, testvalue, karmascore))
+
+        # Check against domain
+        if is_dom.search(testvalue):
+            if check_dom(valuetype, testvalue, wl_dom, 'WHITELIST'): # Whitelisted
+                return False
+
+            elif check_dom(valuetype, testvalue, bl_dom, 'BLACKLIST'): # Blacklisted
+                return True
+
+            # Check if Domain is a rev-arpa domain, if it is, check its IP value
+            ip = False
+            if ip4arpa.search(testvalue):
+                ip = '.'.join(testvalue.strip('.').split('.')[0:4][::-1]) # IPv4
+            elif ip6arpa.search(testvalue):
+                ip = ':'.join(filter(None, regex.split('(.{4,4})', ''.join(testvalue.strip('.').split('.')[0:32][::-1])))) # IPv6
+
+            if ip:
+                checkip = True
+                testvalue = ip
 
     # Check against IP4
     if checkip and is_ip4.search(testvalue):
@@ -378,6 +484,8 @@ def init(id, cfg):
     global wl_big_rx
     global bl_big_rx
     global cache
+    global karma
+    global karmacache
 
     # Init Lists
     config = dict()
@@ -389,9 +497,11 @@ def init(id, cfg):
     bl_ip6 = pytricia.PyTricia(28)
     wl_rx = set()
     bl_rx = set()
+    karma = dict()
 
-    # Cache
+    # Caches
     cache = TTLCache(1024, 300) # Size and TTL
+    karmacache = TTLCache(8192, 86400)
 
     # CNAME Collapsing
     config['collapse'] = True
@@ -402,6 +512,11 @@ def init(id, cfg):
     # Block IP Families
     config['blockip4'] = False
     config['blockip6'] = True
+
+    # Karma
+    config['karmaenable'] = True
+    config['karmalist'] = ["/opt/unbound-dns-filter/karma.list"]
+    config['karmathreshold'] = 15
 
     # White/Blacklists
     # See: https://github.com/cbuijs/accomplist/tree/master/standard
@@ -421,6 +536,12 @@ def init(id, cfg):
         bl_big_rx = regex.compile('|'.join('(?:{0})'.format(x) for x in bl_rx), regex.I)
     except BaseException as err:
         log_err('BIG-REGEX-COMPILE-ERROR: {0}'.format(err))
+
+    if config['karmaenable']:
+        karma = get_karma(karma, wl_dom, bl_dom)
+        log_info('KARMA: {0} entries'.format(len(karma)))
+        karma = read_karma(config['karmalist'], 'KARMALIST', karma)
+        log_info('KARMA: {0} entries'.format(len(karma)))
 
     log_info('Initializing Finished')
 
