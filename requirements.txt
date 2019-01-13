@@ -2,3 +2,4 @@ cachetools>=3.0.0
 pytricia>=1.0.0        
 regex>=2018.11.22   
 requests>=2.21.0       
+tldextract>=2.2.0      
