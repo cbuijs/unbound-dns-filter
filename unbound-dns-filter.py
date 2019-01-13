@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 '''
 =========================================================================================
- dns-filter.py: v0.30-20190113 Copyright (C) 2019 Chris Buijs <cbuijs@chrisbuijs.com>
+ dns-filter.py: v0.31-20190113 Copyright (C) 2019 Chris Buijs <cbuijs@chrisbuijs.com>
 =========================================================================================
 
  DNS filtering extension for the unbound DNS resolver.
@@ -514,7 +514,7 @@ def init(id, cfg):
     config['blockip6'] = True
 
     # Karma
-    config['karmaenable'] = True
+    config['karmaenable'] = False
     config['karmalist'] = ["/opt/unbound-dns-filter/karma.list"]
     config['karmathreshold'] = 15
 
