@@ -1,3 +1,4 @@
 *.sh
 unboundmodule.py
 *.backup.*
+*.shelve
