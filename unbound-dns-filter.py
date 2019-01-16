@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 '''
 =========================================================================================
- dns-filter.py: v0.50-20190116 Copyright (C) 2019 Chris Buijs <cbuijs@chrisbuijs.com>
+ dns-filter.py: v0.51-20190116 Copyright (C) 2019 Chris Buijs <cbuijs@chrisbuijs.com>
 =========================================================================================
 
  DNS filtering extension for the unbound DNS resolver.
@@ -832,7 +832,8 @@ def operate(id, event, qstate, qdata):
 
                         log_info('COLLAPSED: {0}'.format(firstname))
 
-                    log_info('RESPONSE: {0}/{1} -> {2} RRs'.format(rrs[0][0], rrs[0][2], len(rrs)))
+                    if rrs:
+                        log_info('RESPONSE: {0}/{1} -> {2} RRs'.format(rrs[0][0], rrs[0][2], len(rrs)))
 
             else:
                 qstate.return_rcode = rc
