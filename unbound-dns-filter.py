@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 '''
 =========================================================================================
- dns-filter.py: v0.31-20190113 Copyright (C) 2019 Chris Buijs <cbuijs@chrisbuijs.com>
+ dns-filter.py: v0.35-20190116 Copyright (C) 2019 Chris Buijs <cbuijs@chrisbuijs.com>
 =========================================================================================
 
  DNS filtering extension for the unbound DNS resolver.
@@ -97,6 +97,8 @@ def update_cache(name, status):
         log_info('UPDATE-CACHE: {0} is BLACKLISTED'.format(name))
     elif status is False:
         log_info('UPDATE-CACHE: {0} is WHITELISTED'.format(name))
+    else:
+        log_info('UPDATE-CACHE: {0} is NOTLISTED'.format(name))
     cache[name] = status
 
     return True
@@ -273,6 +275,64 @@ def read_karma(filenames, listname, klist):
 
     return klist
 
+def unreg_list(domlist, big_rx, listname):
+    log_info('UNREG: Unregging {0}'.format(listname))
+    newdomlist = dict()
+    beforecount = len(domlist)
+    for dom in dom_sort(domlist.keys()):
+        match = big_rx.search(dom)
+        if not match: 
+            newdomlist[dom] = domlist[dom]
+
+    aftercount = len(newdomlist)
+    log_info('UNREG: {0} went from {1} to {2} entries ({3})'.format(listname, beforecount, aftercount, aftercount - beforecount))
+    return newdomlist
+
+def undom_list(domlist, listname):
+    log_info('UNDOM: Uncomplicating {0}'.format(listname))
+    newdomlist = dict()
+    beforecount = len(domlist)
+    for dom in dom_sort(domlist):
+        fqdn = False
+        removeit = False
+        for label in filter(None, dom.split('.')[::-1]):
+            if fqdn:
+                fqdn = label + '.' + fqdn
+            else:
+                fqdn = label + '.'
+
+            if fqdn in domlist and dom != fqdn:
+                removeit = True
+                log_info('UNDOM [{0}]: {1} -> {2}'.format(listname, dom, fqdn))
+                break
+
+        if removeit is False:
+            newdomlist[dom] = domlist[dom]
+
+    aftercount = len(newdomlist)
+    log_info('UNDOM: {0} went from {1} to {2} entries ({3})'.format(listname, beforecount, aftercount, aftercount - beforecount))
+    return newdomlist
+
+def unip_list(iplist, ip4, listname):
+    if ip4:
+        newiplist = pytricia.PyTricia(32)
+    else:
+        newiplist = pytricia.PyTricia(128)
+
+    for ip in iplist:
+        removeit = False
+        if ip in iplist:
+            cidr = iplist.get_key(ip)
+            if ip != cidr:
+                removeit = True
+                log_info('UNIP [{0}]: {1} -> {2}'.format(listname, ip, cidr))
+                break
+
+        if removeit is False:
+            newiplist[ip] = iplist[ip]
+
+    return newiplist
+
 def file_exist(file, isdb):
     if file:
         try:
@@ -327,12 +387,21 @@ def get_lines(filename, listname):
 
 def is_blacklisted(value, valuetype, checkip):
     testvalue = regex.split('\s+', str(value))[-1]
+    match = False
     if testvalue in cache:
-        result = cache.get(testvalue, None)
+        match = testvalue
+    elif not is_ip.search(testvalue):
+        match = check_dom(valuetype, testvalue, cache, 'CACHE')
+
+    if match:
+        result = cache.get(match, None)
+        if match != testvalue:
+            match = 'PARENT:' + match
+
         if result is True:
-            log_info('CACHE-BLACKLISTED: {0}'.format(testvalue))
+            log_info('CACHE-BLACKLISTED: {0} -> {1}'.format(testvalue, match))
         elif result is False:
-            log_info('CACHE-WHITELISTED: {0}'.format(testvalue))
+            log_info('CACHE-WHITELISTED: {0} -> {1}'.format(testvalue, match))
         return result
 
     result = check_blacklisted(testvalue, valuetype, checkip)
@@ -438,7 +507,7 @@ def check_dom(valuetype, testvalue, domlist, listname):
         else:
             fqdn = label + '.'
 
-        # Check if Domain Whitelisted
+            # Check if Domain Whitelisted
         if fqdn in domlist:
             log_info('{0}-{1}-DOMAIN: \"{2}\" -> \"{3}\"'.format(valuetype, listname, testvalue, fqdn))
             return fqdn
@@ -462,6 +531,13 @@ def check_ip(valuetype, testvalue, orgtestvalue, iplist, listname, rc):
         return True
 
     return False
+
+def dom_sort(domlist):
+    newdomlist = list()
+    for y in sorted([x.split('.')[::-1] for x in domlist]):
+        newdomlist.append('.'.join(y[::-1]))
+
+    return newdomlist
 
 ##########################################################################################
 # UNBOUND DEFS START
@@ -493,8 +569,8 @@ def init(id, cfg):
     bl_dom = dict()
     wl_ip4 = pytricia.PyTricia(32)
     bl_ip4 = pytricia.PyTricia(32)
-    wl_ip6 = pytricia.PyTricia(28)
-    bl_ip6 = pytricia.PyTricia(28)
+    wl_ip6 = pytricia.PyTricia(128)
+    bl_ip6 = pytricia.PyTricia(128)
     wl_rx = set()
     bl_rx = set()
     karma = dict()
@@ -537,6 +613,19 @@ def init(id, cfg):
     except BaseException as err:
         log_err('BIG-REGEX-COMPILE-ERROR: {0}'.format(err))
 
+    # uncomplicating lists
+    wl_dom = unreg_list(wl_dom, wl_big_rx, 'WHITELIST') 
+    bl_dom = unreg_list(bl_dom, bl_big_rx, 'BLACKLIST')
+    bl_dom = unreg_list(bl_dom, wl_big_rx, 'WHITELIST-BLACKLIST')
+
+    wl_dom = undom_list(wl_dom, 'WHITELIST')
+    bl_dom = undom_list(bl_dom, 'BLACKLIST')
+
+    wl_ip4 = unip_list(wl_ip4, True, 'WHITELIST-IP4')
+    bl_ip4 = unip_list(bl_ip4, True, 'BLACKLIST-IP4')
+    wl_ip6 = unip_list(wl_ip6, False, 'WHITELIST-IP6')
+    bl_ip6 = unip_list(bl_ip6, False, 'BLACKLIST-IP6')
+    
     if config['karmaenable']:
         karma = get_karma(karma, wl_dom, bl_dom)
         log_info('KARMA: {0} entries'.format(len(karma)))
@@ -564,14 +653,12 @@ def operate(id, event, qstate, qdata):
         qname = qstate.qinfo.qname_str.lower()
         qclass = qstate.qinfo.qclass_str.upper()
         qtype = qstate.qinfo.qtype_str.upper()
-        rc = RCODE_REFUSED
 
         if qclass == 'IN' and qtype != 'ANY':
             if config['blockip4'] and (qtype == 'A' or (qtype == 'PTR' and qname.endswith('.in-addr.arpa.'))):
                log_info('BLOCK-IPV4: {0}/{1}'.format(qname, qtype))
             elif config['blockip6'] and (qtype == 'AAAA' or (qtype == 'PTR' and qname.endswith('.ip6.arpa.'))):
                log_info('BLOCK-IPV6: {0}/{1}'.format(qname, qtype))
-               rc = RCODE_NOERROR # Search-domain workaround
             else:
                result = is_blacklisted(qname, 'QNAME', False)
                if result is not True:
@@ -579,7 +666,7 @@ def operate(id, event, qstate, qdata):
                    return True
 
         # REFUSE
-        qstate.return_rcode = rc
+        qstate.return_rcode = RCODE_REFUSED
         qstate.ext_state[id] = MODULE_FINISHED 
         return True
 
@@ -645,6 +732,7 @@ def operate(id, event, qstate, qdata):
                                 return True
 
                         log_info('COLLAPSED: {0}'.format(firstname))
+
             else:
                 qstate.return_rcode = rc
 
@@ -658,7 +746,6 @@ def operate(id, event, qstate, qdata):
                 storeQueryInCache(qstate, qstate.return_msg.qinfo, qstate.return_msg.rep, 0)
                 qstate.ext_state[id] = MODULE_FINISHED
                 return True
-
         else:
             log_err('NO RESPONSE MESSAGE')
             qstate.ext_state[id] = MODULE_ERROR
