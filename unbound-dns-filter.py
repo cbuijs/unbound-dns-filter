@@ -587,7 +587,7 @@ def check_dom(valuetype, testvalue, domlist, listname):
 
             # Check if Domain Whitelisted
         if fqdn in domlist:
-            log_info('{0}-{1}-DOMAIN: \"{2}\" -> \"{3}\"'.format(valuetype, listname, testvalue, fqdn))
+            #log_info('{0}-{1}-DOMAIN: \"{2}\" -> \"{3}\"'.format(valuetype, listname, testvalue, fqdn))
             return fqdn
 
     return False
