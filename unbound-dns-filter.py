@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 '''
 =========================================================================================
- dns-filter.py: v0.35-20190116 Copyright (C) 2019 Chris Buijs <cbuijs@chrisbuijs.com>
+ dns-filter.py: v0.50-20190116 Copyright (C) 2019 Chris Buijs <cbuijs@chrisbuijs.com>
 =========================================================================================
 
  DNS filtering extension for the unbound DNS resolver.
@@ -12,6 +12,9 @@
 # Standard/Included modules
 import sys, os, os.path, time
 sys.path.append("/usr/local/lib/python2.7/dist-packages/")
+
+# Shelve
+import dbm, shelve
 
 # Data
 import json, struct
@@ -89,16 +92,16 @@ def decode_data(rawdata, start):
        text += c
     return text.lower()
 
-def update_cache(name, status):
-    if name in cache:
+def update_cache(name, status, force):
+    if name and force is False and name in cache:
         return False
 
     if status is True:
         log_info('UPDATE-CACHE: {0} is BLACKLISTED'.format(name))
     elif status is False:
         log_info('UPDATE-CACHE: {0} is WHITELISTED'.format(name))
-    else:
-        log_info('UPDATE-CACHE: {0} is NOTLISTED'.format(name))
+    #else:
+    #    log_info('UPDATE-CACHE: {0} is NOTLISTED'.format(name))
     cache[name] = status
 
     return True
@@ -275,6 +278,81 @@ def read_karma(filenames, listname, klist):
 
     return klist
 
+def to_dict(iplist):
+    newdict = dict()
+    for i in iplist:
+        newdict[i] = iplist[i]
+    return newdict
+
+
+def from_dict(fromlist, tolist):
+    for i in fromlist:
+        tolist[i] = fromlist[i]
+    return tolist
+
+def save_it(savefile):
+    log_info('SAVE: \"{0}\"'.format(savefile))
+
+    try:
+        s = shelve.DbfilenameShelf(savefile, flag='n', protocol=2)
+        s.clear()
+        
+        s['wl_dom'] = wl_dom
+        s['bl_dom'] = bl_dom
+        s['wl_ip4'] = to_dict(wl_ip4)
+        s['bl_ip4'] = to_dict(bl_ip4)
+        s['wl_ip6'] = to_dict(wl_ip6)
+        s['bl_ip6'] = to_dict(bl_ip6)
+        s['wl_big_rx'] = wl_big_rx
+        s['bl_big_rx'] = bl_big_rx
+        s['karma'] = karma
+
+        s.close()
+
+    except BaseException as err:
+        log_err('LOAD-ERROR: Unable to open/write file \"{0}\" - {1}'.format(savefile, err))
+        return False
+
+    return True
+
+def load_it(loadfile):
+    log_info('LOAD: \"{0}\"'.format(loadfile))
+    global config
+    global wl_dom
+    global bl_dom
+    global wl_ip4
+    global bl_ip4
+    global wl_ip6
+    global bl_ip6
+    global wl_big_rx
+    global bl_big_rx
+    global karma
+
+    try:
+        s = shelve.DbfilenameShelf(loadfile, flag='r', protocol=2)
+
+        wl_dom = s['wl_dom']
+        bl_dom = s['bl_dom']
+        wl_ip4 = pytricia.PyTricia(32)
+        from_dict(s['wl_ip4'], wl_ip4)
+        bl_ip4 = pytricia.PyTricia(32)
+        from_dict(s['bl_ip4'], bl_ip4)
+        wl_ip6 = pytricia.PyTricia(128)
+        from_dict(s['wl_ip6'], wl_ip6)
+        bl_ip6 = pytricia.PyTricia(128)
+        from_dict(s['bl_ip6'], bl_ip6)
+        wl_big_rx = s['wl_big_rx']
+        bl_big_rx = s['bl_big_rx']
+        karma = s['karma']
+
+        s.close()
+
+    except BaseException as err:
+        log_err('SAVE-ERROR: Unable to open/read file \"{0}\" - {1}'.format(loadfile, err))
+        return False
+
+    return True
+
 def unreg_list(domlist, big_rx, listname):
     log_info('UNREG: Unregging {0}'.format(listname))
     newdomlist = dict()
@@ -405,7 +483,7 @@ def is_blacklisted(value, valuetype, checkip):
         return result
 
     result = check_blacklisted(testvalue, valuetype, checkip)
-    update_cache(testvalue, result)
+    update_cache(testvalue, result, False)
     return result
 
 def check_blacklisted(testvalue, valuetype, checkip):
@@ -520,13 +598,13 @@ def check_ip(valuetype, testvalue, orgtestvalue, iplist, listname, rc):
         if orgtestvalue != testvalue:
             log_info('{0}-{1}-IP: {2} -> {3} -> {4}'.format(valuetype, listname, orgtestvalue, testvalue, iplist.get_key(testvalue)))
             log_info('{0}-{1}-IP-ADD-DOMAIN: {2} ({3})'.format(valuetype, listname, orgtestvalue, testvalue))
-            update_cache(orgtestvalue, rc)
+            update_cache(orgtestvalue, rc, False)
         else:
             log_info('{0}-{1}-IP: {2} -> {3}'.format(valuetype, listname, orgtestvalue, iplist.get_key(testvalue)))
             iprev = rev_ip(testvalue)
             if iprev:
                 log_info('{0}-{1}-IP-ADD-ARPA: {2} ({3})'.format(valuetype, listname, iprev, testvalue))
-                update_cache(iprev, rc)
+                update_cache(iprev, rc, False)
 
         return True
 
@@ -594,6 +672,9 @@ def init(id, cfg):
     config['karmalist'] = ["/opt/unbound-dns-filter/karma.list"]
     config['karmathreshold'] = 15
 
+    # Savefile
+    config['savefile'] = '/opt/unbound-dns-filter/save.shelve'
+
     # White/Blacklists
     # See: https://github.com/cbuijs/accomplist/tree/master/standard
     config['whitelist'] = ["/opt/accomplist/standard/plain.white.domain.list", "/opt/accomplist/standard/plain.white.ip4cidr.list", "/opt/accomplist/standard/plain.white.ip6cidr.list", "/opt/accomplist/standard/plain.white.regex.list"]
@@ -602,36 +683,47 @@ def init(id, cfg):
     # Get config
     config = get_config(config, '/opt/unbound-dns-filter/unbound-dns-filter.conf')
 
-    # Read lists
-    wl_dom, wl_ip4, wl_ip6, wl_rx = read_list(config['whitelist'], 'WhiteList', wl_dom, wl_ip4, wl_ip6, wl_rx)
-    bl_dom, bl_ip4, bl_ip6, bl_rx = read_list(config['blacklist'], 'BlackList', bl_dom, bl_ip4, bl_ip6, bl_rx)
+    age = file_exist(config['savefile'], True)
+    if age and age < 3600:
+        if not load_it(config['savefile']):
+            sys.exit(1)
 
-    # Create combined regex for speed
-    try:
-        wl_big_rx = regex.compile('|'.join('(?:{0})'.format(x) for x in wl_rx), regex.I)
-        bl_big_rx = regex.compile('|'.join('(?:{0})'.format(x) for x in bl_rx), regex.I)
-    except BaseException as err:
-        log_err('BIG-REGEX-COMPILE-ERROR: {0}'.format(err))
+    else:
+        # Read lists
+        wl_dom, wl_ip4, wl_ip6, wl_rx = read_list(config['whitelist'], 'WhiteList', wl_dom, wl_ip4, wl_ip6, wl_rx)
+        bl_dom, bl_ip4, bl_ip6, bl_rx = read_list(config['blacklist'], 'BlackList', bl_dom, bl_ip4, bl_ip6, bl_rx)
 
-    # uncomplicating lists
-    wl_dom = unreg_list(wl_dom, wl_big_rx, 'WHITELIST') 
-    bl_dom = unreg_list(bl_dom, bl_big_rx, 'BLACKLIST')
-    bl_dom = unreg_list(bl_dom, wl_big_rx, 'WHITELIST-BLACKLIST')
+        # Create combined regex for speed
+        try:
+            wl_big_rx = regex.compile('|'.join('(?:{0})'.format(x) for x in wl_rx), regex.I)
+            bl_big_rx = regex.compile('|'.join('(?:{0})'.format(x) for x in bl_rx), regex.I)
+        except BaseException as err:
+            log_err('BIG-REGEX-COMPILE-ERROR: {0}'.format(err))
 
-    wl_dom = undom_list(wl_dom, 'WHITELIST')
-    bl_dom = undom_list(bl_dom, 'BLACKLIST')
+        # uncomplicating lists
+        wl_dom = unreg_list(wl_dom, wl_big_rx, 'WHITELIST') 
+        bl_dom = unreg_list(bl_dom, bl_big_rx, 'BLACKLIST')
+        bl_dom = unreg_list(bl_dom, wl_big_rx, 'WHITELIST-BLACKLIST')
 
-    wl_ip4 = unip_list(wl_ip4, True, 'WHITELIST-IP4')
-    bl_ip4 = unip_list(bl_ip4, True, 'BLACKLIST-IP4')
-    wl_ip6 = unip_list(wl_ip6, False, 'WHITELIST-IP6')
-    bl_ip6 = unip_list(bl_ip6, False, 'BLACKLIST-IP6')
-    
-    if config['karmaenable']:
-        karma = get_karma(karma, wl_dom, bl_dom)
-        log_info('KARMA: {0} entries'.format(len(karma)))
-        karma = read_karma(config['karmalist'], 'KARMALIST', karma)
-        log_info('KARMA: {0} entries'.format(len(karma)))
+        wl_dom = undom_list(wl_dom, 'WHITELIST')
+        bl_dom = undom_list(bl_dom, 'BLACKLIST')
 
+        wl_ip4 = unip_list(wl_ip4, True, 'WHITELIST-IP4')
+        bl_ip4 = unip_list(bl_ip4, True, 'BLACKLIST-IP4')
+        wl_ip6 = unip_list(wl_ip6, False, 'WHITELIST-IP6')
+        bl_ip6 = unip_list(bl_ip6, False, 'BLACKLIST-IP6')
+     
+        if config['karmaenable']:
+            karma = get_karma(karma, wl_dom, bl_dom)
+            log_info('KARMA: {0} entries'.format(len(karma)))
+            karma = read_karma(config['karmalist'], 'KARMALIST', karma)
+            log_info('KARMA: {0} entries'.format(len(karma)))
+
+        save_it(config['savefile'])
+
+    log_info('WHITELIST: {0} Domains, {1} IPv4s, and {2} IPv6s'.format(len(wl_dom), len(wl_ip4), len(wl_ip6)))
+    log_info('BLACKLIST: {0} Domains, {1} IPv4s, and {2} IPv6s'.format(len(bl_dom), len(bl_ip4), len(bl_ip6)))
+    log_info('KARMA: {0} Karma-Labels'.format(len(karma)))
     log_info('Initializing Finished')
 
     return True
@@ -682,8 +774,12 @@ def operate(id, event, qstate, qdata):
                 for rrset in range(0, rep.an_numrrsets):
                     rk = rep.rrsets[rrset].rk
                     rdtype = rk.type_str.upper()
+                    qname = False
                     if rdtype in ('A', 'AAAA', 'CNAME', 'MX', 'NS', 'PTR', 'SOA', 'SRV'):
                         rdname = rk.dname_str.lower()
+                        if not qname:
+                            qname = rdname
+
                         status = is_blacklisted(rdname, 'CHAIN-QNAME', False)
                         if status is not None:
                            break
@@ -704,7 +800,10 @@ def operate(id, event, qstate, qdata):
                             if rdata:
                                 status = is_blacklisted(rdata, 'DATA', True)
                                 if status is not None:
-                                    update_cache(rdname, status)
+                                    update_cache(qname, status, True)
+                                    if rdname != qname:
+                                        update_cache(rdname, status, True)
+                                    # Already done in is_blacklisted: update_cache(rdata, status, True)
                                     break
 
                             rrs.append((rdname, repttl, rdtype, rdata))
@@ -732,6 +831,8 @@ def operate(id, event, qstate, qdata):
                                 return True
 
                         log_info('COLLAPSED: {0}'.format(firstname))
+
+                    log_info('RESPONSE: {0}/{1} -> {2} RRs'.format(rrs[0][0], rrs[0][2], len(rrs)))
 
             else:
                 qstate.return_rcode = rc
