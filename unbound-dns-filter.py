@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 '''
 =========================================================================================
- dns-filter.py: v0.51-20190116 Copyright (C) 2019 Chris Buijs <cbuijs@chrisbuijs.com>
+ dns-filter.py: v0.52-20190118 Copyright (C) 2019 Chris Buijs <cbuijs@chrisbuijs.com>
 =========================================================================================
 
  DNS filtering extension for the unbound DNS resolver.
@@ -78,6 +78,24 @@ def get_data(rdtype, answer):
         rdata = False
 
     return rdata
+
+# Log responses
+def log_responses(qstate, tag):
+    rep = qstate.return_msg.rep
+    rc = rep.flags & 0xf
+    if rc == RCODE_NOERROR:
+        for rrset in range(0, rep.an_numrrsets):
+            rk = rep.rrsets[rrset].rk
+            rdname = rk.dname_str.lower()
+            rdtype = rk.type_str.upper()
+            data = rep.rrsets[rrset].entry.data
+            for rr in range(0, data.count):
+                rdttl = data.rr_ttl[rr]
+                answer = data.rr_data[rr]
+                rdata = get_data(rdtype, answer)
+                log_info('{0}: {1} {2} IN {3} {4}'.format(tag, rdname, rdttl, rdtype, rdata))
+
+    return True
 
 # Decode names/strings from response message
 def decode_data(rawdata, start):
@@ -770,6 +788,7 @@ def operate(id, event, qstate, qdata):
             rc = rep.flags & 0xf
             status = None
             if (rc == RCODE_NOERROR) and (rep.an_numrrsets > 0):
+                log_responses(qstate, 'RESPONSE-FROM-SERVER')
                 rrs = list()
                 for rrset in range(0, rep.an_numrrsets):
                     rk = rep.rrsets[rrset].rk
@@ -795,7 +814,7 @@ def operate(id, event, qstate, qdata):
                         countrr = 0
                         for rr in range(0, data.count):
                             answer = data.rr_data[rr]
-                            #rdttl = data.rr_ttl[rr]
+                            #rdttl = data.rr_ttl[rr] or repttl
                             rdata = get_data(rdtype, answer)
                             if rdata:
                                 status = is_blacklisted(rdata, 'DATA', True)
@@ -820,27 +839,28 @@ def operate(id, event, qstate, qdata):
                         else:
                             rmsg = DNSMessage(firstname, RR_TYPE_AAAA, RR_CLASS_IN, PKT_QR | PKT_RA )
 
+                        count = 0
                         for rr in rrs:
                             if rr[2] == rrs[-1][2]:
+                                count += 1
                                 rmsg.answer.append('{0} {1} IN {2} {3}'.format(firstname, repttl, rr[2], rr[3]))
 
-                            rmsg.set_return_msg(qstate)
-                            if not rmsg.set_return_msg(qstate):
-                                log_err('CNAME COLLAPSE ERROR: ' + str(rmsg.answer))
-                                qstate.ext_state[id] = MODULE_ERROR
-                                return True
+                        rmsg.set_return_msg(qstate)
+                        if not rmsg.set_return_msg(qstate):
+                            log_err('CNAME COLLAPSE ERROR: ' + str(rmsg.answer))
+                            qstate.ext_state[id] = MODULE_ERROR
+                            return True
 
-                        log_info('COLLAPSED: {0}'.format(firstname))
-
-                    if rrs:
-                        log_info('RESPONSE: {0}/{1} -> {2} RRs'.format(rrs[0][0], rrs[0][2], len(rrs)))
+                        log_info('COLLAPSE: {0}/{1} went from {2} to {3} ({4}) RRs'.format(firstname, rrs[0][2], len(rrs), count, rrs[-1][2]))
 
             else:
                 qstate.return_rcode = rc
 
+
             if status is not True:
                 # Allow changes and cache
                 #qstate.return_rcode = RCODE_NOERROR
+                log_responses(qstate, 'RESPONSE-TO-CLIENT')
                 if qstate.return_msg.qinfo:
                     invalidateQueryInCache(qstate, qstate.return_msg.qinfo)
                 qstate.no_cache_store = 0
@@ -848,6 +868,7 @@ def operate(id, event, qstate, qdata):
                 storeQueryInCache(qstate, qstate.return_msg.qinfo, qstate.return_msg.rep, 0)
                 qstate.ext_state[id] = MODULE_FINISHED
                 return True
+
         else:
             log_err('NO RESPONSE MESSAGE')
             qstate.ext_state[id] = MODULE_ERROR
