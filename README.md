@@ -1,4 +1,4 @@
-# unbound-dns-filter
+# unbound-dns-filter (ABANDONED)
 Python Module for UNBOUND to filter DNS requests/responses
 
 This is basically a rewrite from scratch of <a href="https://www.github.com/cbuijs/unbound-dns-firewall">unbound-dns-firewall</a> with all lessons learned to make it way more lean, less cluttered and going back to basics on features.
